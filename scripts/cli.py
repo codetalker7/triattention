@@ -32,6 +32,7 @@ MODEL_SPECS: Dict[str, str] = {
     "DeepSeek-R1-Distill-Qwen-7B": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     "DeepSeek-R1-Distill-Llama-8B": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
     "Qwen3-8B": "Qwen/Qwen3-8B",
+    "Qwen3-0.6B": "Qwen/Qwen3-0.6B",
 }
 
 DATASETS = ["aime24", "aime25", "math500"]

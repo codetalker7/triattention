@@ -1,0 +1,377 @@
+TriAttention: Efficient Long Reasoning with Trigonometric KV Compression
+
+*Compress KV cache by 10.7x and boost throughput by 2.5x on long reasoning tasks -- with no accuracy loss.*
+
+[2026-08-04] TriAttention is now officially integrated into NVIDIA TensorRT-LLM as a KV-cache compression method (NVIDIA/TensorRT-LLM#16957). See the TensorRT-LLM TriAttention guide.
+
+[2026-04-21] SGLang backend support added — TriAttention now runs on SGLang in addition to vLLM. See SGLang Integration.
+
+[2026-04-14] Community DGX Spark (GB10/sm-121) enablement by @dscain — vLLM support merged, non-vLLM path in progress.
+
+[2026-04-12] TriAttention now supports AR video generation with KV cache compression. See LongLive README.
+
+[2026-04-11] Community C/ggml port for llama.cpp (HIP/ROCm) by @domvox — enables TriAttention on AMD GPUs via llama.cpp, with ~6.8× KV reduction when composed with TurboQuant. See triattention-ggml.
+
+[2026-04-09] Experimental MLX and TurboQuant support for Apple Silicon (M1/M2/M3/M4) — thanks to @DeadByDawn101 (RavenX AI) for proposing and contributing this feature.
+
+2.5x throughput on AIME25 long reasoning while matching Full Attention accuracy (40.8 vs 40.8)
+
+10.7x KV memory reduction with trigonometric frequency-domain compression
+
+OpenClaw compatible — enables local deployment on 24GB RTX 4090
+
+Officially integrated into NVIDIA TensorRT-LLM — see TensorRT-LLM Integration
+
+Pre-RoPE Q/K vectors in long reasoning models concentrate around fixed centers that determine distance preferences via a trigonometric series. TriAttention scores keys using these centers and norms instead of requiring representative query selection, enabling accurate KV cache compression without the overhead of existing attention-based methods.
+
+OpenClaw -- OpenClaw manual configuration
+
+Reproduction Guide -- full experiment commands for all benchmarks
+
+Calibration Guide -- generating custom Q/K statistics
+
+MLX Support -- supporting Apple Silicon Macs (M1/M2/M3/M4) via the MLX
+
+SGLang Integration -- deploying TriAttention with SGLang as the inference backend
+
+Video Generation -- KV cache compression for long video generation with LongLive
+
+Full Results -- complete tables, figures, and analysis
+
+TriAttention's vLLM server exposes an OpenAI-compatible API, which means you can use it directly as a custom provider in OpenClaw.
+
+Follow the Installation instructions, then start a vLLM server with the recommended settings below.
+
+In OpenClaw, add a custom provider pointing to your vLLM server (e.g. http://localhost:8000/v1).
+
+For manual configuration or troubleshooting, see the OpenClaw Manual Configuration Guide.
+
+Recommended Server Settings for Chat
+
+Interactive chat workloads differ from offline benchmarks — conversations are long-running and prefill chunks can trigger compression at unexpected points. We recommend the following adjustments:
+
+Key differences from the default server mode:
+
+--enable-prefix-caching false — Prefix caching is incompatible with KV compression currently; disable it to avoid incorrect cache hits on compressed entries.
+
+--max-num-batched-tokens 1024 — Limits the prefill chunk size. Large chunks can overshoot the KV budget in a single step before compression has a chance to trigger, leading to OOM.
+
+TRIATTN_RUNTIME_KV_BUDGET=12000 — Chat sessions accumulate context across many turns; a larger budget (e.g. 12k) keeps more history available and avoids aggressive eviction.
+
+Benchmark datasets (AIME 2024, AIME 2025, MATH-500) are automatically downloaded from HuggingFace on first run -- no manual data preparation is needed. The evaluation scripts handle downloading, caching, and formatting transparently.
+
+AIME24 / AIME25 (KV Budget = 2048, DS-Llama = 512)
+
+See docs/results.md for complete results including MATH-500 accuracy table, accuracy vs. budget curves, and DFS memory retention analysis.
+
+TriAttention includes a vLLM plugin that enables transparent KV cache compression for production deployment. After installation, vLLM automatically discovers and activates the plugin -- no code changes required.
+
+vLLM with DGX Spark / GB10
+
+To enable vLLM in DGX Spark / GB10, run these installation steps instead:
+
+Verify the first vLLM log line is [TriAttention] Runtime (V2) plugin activated: patch_scheduler=True patch_worker=True.
+
+TriAttention requires precomputed Q/K frequency statistics for scoring. We provide pre-calibrated stats for supported models in triattention/vllm/stats/. See the Calibration Guide for generating stats for custom models.
+
+TriAttention is officially supported in NVIDIA TensorRT-LLM as a KV-cache compression method (NVIDIA/TensorRT-LLM#16957). For installation, configuration, and usage, follow the official TensorRT-LLM TriAttention guide. The required calibration file is generated with this repository — see the Calibration Guide.
+
+[x] TensorRT-LLM integration (official upstream support)
+
+[ ] Support for more model architectures
+
+Independent ports and integrations maintained by the community:
+
+> Note: Community projects are independently maintained and not officially supported. Please direct questions and issues to each project's own issue tracker.
+
+We thank the following projects for their contributions and inspiration:
+
+@DeadByDawn101 (RavenX AI) — MLX port for Apple Silicon
+
+@kishan5111 — GPT-OSS-120B model integration
+
+@dscain — DGX Spark (GB10) enablement for vLLM and non-vLLM paths
+
+@yjl-001 — tolerate no_compactable_groups skips in strict compaction mode (#16)
+
+This project is licensed under the Apache License 2.0. See LICENSE for details.
+
+TriAttention uses pre-computed statistics (Q/K centers and norms) for each model. Pre-computed stats for supported models are included in triattention/calibration/.
+
+Generating Stats for a Custom Model
+
+Any plain-text file containing natural, coherent text. The script tokenizes it and runs a single forward pass to collect query-state frequency statistics.
+
+Domain-agnostic: calibration and inference do not need to be in the same domain — e.g., calibrating on code and running math reasoning works fine.
+
+Robust: we have tested across various text types (code, math, general prose) with consistent results.
+
+Longer is better: provide enough text to approach --max-length (default 32768 tokens) for best coverage.
+
+Avoid degenerate inputs: do not use garbled/corrupted text or long repetitive loops (e.g., the same sentence copied thousands of times).
+
+A Wikipedia article, a book chapter, or a source code file are all good choices.
+
+The calibration script runs a forward pass on plain text input, captures query states from every attention layer, inverts RoPE, and computes per-head frequency statistics. The resulting .pt file is loaded at inference time to score keys via the trigonometric series.
+
+Stats are organised by experiment target. Each sub-directory contains per-model .pt files:
+
+Experiment configs and scripts are in scripts/experiments/.
+
+See scripts/experiments/ for full experiment configurations covering all model-dataset-budget combinations reported in the paper.
+
+TriAttention supports SGLang as an inference backend, in parallel with the vLLM path. KV cache compression is installed via scheduler-side monkey-patches, so no upstream SGLang changes are required.
+
+Launch an SGLang server with TriAttention enabled:
+
+The python -m triattention.sglang entry point wraps SGLang's server launcher. It:
+
+Installs scheduler / worker / input-patch hooks in the main process and in every TP child.
+
+Appends --disable-radix-cache if you did not pass it explicitly (radix cache is incompatible with KV compression).
+
+Forwards all remaining CLI arguments to SGLang.
+
+See Calibration Guide for how to generate the stats file.
+
+If you prefer to call SGLang's launcher yourself, install the hooks before starting the server:
+
+Radix cache must be disabled. KV compression rewrites the KV pool in-place; radix cache's content-addressed reuse would hit stale entries.
+
+Prefix caching is not supported for the same reason.
+
+Tensor parallelism is supported; stats are automatically sharded per TP rank.
+
+TriAttention MLX Calibration — Apple Silicon
+
+Contributed by @cmfontes (Zero) — June 2026
+
+A calibration pipeline for generating TriAttention frequency statistics on Apple Silicon using MLX. Produces per-head RoPE-aware trig scoring stats for full-attention layers, enabling the same kv_budget compression quality on Metal API that the CUDA pipeline achieves on NVIDIA GPUs.
+
+Class-level dispatch with global table — MLX has no register_forward_pre_hook. We install a single class-level interceptor on Qwen3NextAttention.__call__ and dispatch to per-instance hooks via _HOOK_TABLE[id(module)]. A singleton pattern ensures the original __call__ is saved exactly once on first hook installation, avoiding overwrites across multiple layers.
+
+Q capture at projection point — We tap q_proj() output (split into queries/gate) before q_norm and RoPE, capturing the full [nheads, head_dim] activation for all 16 full-attention layers per forward pass.
+
+Stats format — Output .npz uses the same l_{layer}_h_{head}_q_mean_real|imag|_abs_mean keys as the existing MLX triattention_mlx.py _load_frequency_stats function, ensuring drop-in compatibility.
+
+Known Limitation: Qwen3.6 DeltaNet Layers
+
+Qwen3.6 uses GatedDeltaNet linear attention for 48 of 64 layers (layers 0–2, 4–6, 8–10, etc.) with only 16 full-attention layers (3, 7, 11, …, 63). TriAttention compresses only the full-attention layers, so the majority of the model's KV budget is unaffected. Benchmarks at 4.8× compression showed identical output between norm‑only and trig‑scoring — the DeltaNet layers dominate the signal path. For models with standard attention across all layers (Llama, Mistral, Gemma), the trig‑vs‑norm divergence is expected to be more pronounced.
+
+triattention/mlx/calibrate_mlx.py — Full calibration pipeline with Qwen3NextAttention hooks
+
+triattention/calibration/qwen3.6_27b_stats.npz — Pre‑generated 384‑head stats for Qwen3.6-27B MLX 4‑bit
+
+We attempted to calibrate Qwable-3.6-27b — a full fine‑tune of Qwen3.6‑27B on Fable‑5 reasoning traces. The model uses the same Qwen3NextAttention architecture, so the hooks apply. The blocker was not the architecture — it was the MLX conversion step.
+
+froggeric/qwen3.6-27b-mlx-4bit (pre‑converted 4‑bit MLX) loaded and calibrated in 12 minutes on an M4 Pro (24 GB)
+
+Calibration generated valid 384‑head stats matching the existing _load_frequency_stats format
+
+Full trig‑scoring generation succeeded at 4.8× KV compression on Apple Silicon
+
+Converting Qwable from HF safetensors to MLX format requires loading the full fp16 model (~54 GB), which won't fit in 24 GB RAM
+
+mlx_lm.convert loads the entire model into memory before quantizing — no streaming conversion path exists
+
+The HF_HUB_ENABLE_HF_TRANSFER=1 workaround only helps with download speed, not memory
+
+Cloud conversion (128 GB instance) would work but wasn't scoped for this PR
+
+Request MLX‑native quantized uploads from model publishers (like froggeric's pre‑converted versions)
+
+Use a cloud instance for the single‑pass conversion → upload the resulting MLX model to HF
+
+Add streaming quantization to mlx_lm.convert (out of scope for TriAttention)
+
+AIME24 / AIME25 (KV Budget = 2048, DS-Llama = 512)
+
+MATH-500 (KV Budget = 512)
+
+Accuracy vs. KV budget across MATH-500, AIME24, AIME25, and DFS Memory Retention benchmarks. TriAttention consistently outperforms R-KV and SnapKV across all budget levels. On the Recursive State Query benchmark, TriAttention performs comparably to Full Attention up to depth 16, while R-KV shows catastrophic degradation.
+
+Pre-RoPE Q/K vectors concentrate around fixed centers, enabling trigonometric modeling of attention patterns. This structure is stable across positions and input contexts.
+
+TriAttention MLX — Apple Silicon Port
+
+> 10.7x KV memory reduction, 2.5x throughput on long reasoning — native MLX for M-series Macs.
+
+This directory contains the MLX port of TriAttention. Contributed by @DeadByDawn101.
+
+Original implementation (PyTorch + vLLM): WeianMao/triattention
+
+Unlike TurboQuant which *quantizes* KV values (lossy compression), TriAttention *evicts* low-importance tokens using trigonometric frequency scoring:
+
+> Pre-RoPE Q/K vectors concentrate around fixed centers across positions. These centers determine "distance preferences" via a trigonometric series. Score keys by position → evict low-scoring tokens.
+
+The result: same accuracy as Full Attention, 10.7x less memory.
+
+Stack them: TriAttention evicts unimportant tokens → TurboQuant compresses the survivors → maximum efficiency.
+
+Full Quality Mode (with calibrated stats)
+
+For maximum accuracy, calibrate frequency statistics first:
+
+*MLX port by @DeadByDawn101 — April 2026*
+
+*Original paper: TriAttention: Efficient Long Reasoning with Trigonometric KV Compression*
+
+A dataset for testing LLMs' ability to simulate DFS (Depth-First Search) execution. Unlike existing interactive DFS benchmarks, this dataset requires the model to directly predict the state after executing k steps of DFS given a graph structure and step count k.
+
+Task type: Intermediate state query (non-interactive)
+
+Step range: 20-50 steps (long reasoning chains)
+
+Graph types: Random trees and sparse graphs
+
+Sample count: 100 test samples
+
+Each test sample contains the following fields:
+
+nodes: Node list (labels: 0, 1, 2, ...)
+
+edges: Edge list (undirected edges)
+
+start_node: DFS starting node (typically 0)
+
+steps: Number of DFS steps to execute
+
+current_node: Current node after executing k steps
+
+stack: Current DFS stack state (path from root to current node)
+
+visited_nodes: All visited nodes (sorted)
+
+total_dfs_steps: Total steps for complete DFS traversal
+
+graph_nodes: Number of graph nodes
+
+graph_edges: Number of graph edges
+
+action: Action type at step k ("visit" or "backtrack")
+
+Visit strategy: If the current node has unvisited neighbors, choose the smallest-numbered neighbor (ensures determinism)
+
+Backtrack strategy: If all neighbors of the current node are visited, backtrack to the parent node
+
+Stack maintenance: The stack stores the complete path from the start node to the current node
+
+--num-samples: Number of samples to generate
+
+--min-nodes, --max-nodes: Range of graph node counts
+
+--min-steps, --max-steps: Range of DFS step counts
+
+--graph-types: Graph types (tree, sparse, dense)
+
+--show-sample: Display the first sample
+
+Node accuracy: Whether current_node prediction is correct
+
+Stack accuracy: Whether stack prediction exactly matches
+
+Stack top element correctness ratio
+
+Based on 100-sample dataset (seed=42):
+
+Mean total DFS steps: 48.8
+
+Comparison with Existing DFS Benchmarks
+
+../datasets/dfs_state_query_small.json: Small-step dataset (for quick testing)
+
+../datasets/legacy/dfs_state_query_100.json: Main dataset (100 samples)
+
+../datasets/legacy/dfs_state_query_test.json: Test dataset (10 samples)
+
+Same license as the main AQA-Bench project.
+
+DFS State Query - Small Steps Dataset
+
+Purpose: Quick testing and debugging with shorter reasoning chains
+
+Validity: ✅ 100% valid, 100% correct
+
+Original dataset: 20-50 steps (mean: 33.7)
+
+This dataset: 5-19 steps (mean: 12.2)
+
+Easier to debug and understand
+
+Node count: 10-20 (mean: 15.1)
+
+Sparse: Tree + 1-3 extra edges
+
+Perfect for rapid iteration when developing or debugging:
+
+Based on step count, expected difficulty:
+
+5-9 steps (Easy): High accuracy expected (>90%)
+
+10-14 steps (Medium): Moderate difficulty (~70-90%)
+
+15-19 steps (Harder): Lower accuracy (~50-70%)
+
+Graph generation: NetworkX random trees/sparse graphs
+
+Step selection: Random step in valid range
+
+Validation: All samples verified for correctness
+
+Result: ✅ 30/30 valid, 30/30 correct
+
+To generate a new version with different parameters:
+
+Start here: Use this dataset for initial model testing
+
+Iterate quickly: Small dataset = fast feedback loop
+
+Debug failures: Shorter steps = easier to trace errors
+
+Scale up: Move to dfs_state_query/datasets/legacy/dfs_state_query_100_clean.json after success
+
+../scripts/quick_test.py - Quick evaluation script
+
+Note: This dataset is automatically validated and guaranteed to be free of confusing samples (no empty stacks, steps within valid range).
+
+DFS State Query Evaluation Script Guide
+
+eval_dfs_state_query.py evaluates LLM performance on the DFS state prediction task.
+
+--dataset: Path to DFS state query dataset (JSON format)
+
+--model-path: HuggingFace model path (local or remote)
+
+--output: Output path for results (JSON format)
+
+--max-samples: Maximum number of samples to evaluate (for quick testing; defaults to all)
+
+--max-new-tokens: Maximum tokens for model generation (default: 512)
+
+Results are saved in JSON format:
+
+current_node_correct: Current node prediction accuracy
+
+stack_exact_match: Exact stack match accuracy (strictest)
+
+visited_exact_match: Exact visited-node set match accuracy
+
+stack_depth_correct: Stack depth correctness ratio
+
+stack_top_correct: Stack top element correctness ratio
+
+stack_intersection_ratio: Stack node intersection ratio
+
+visited_f1: Visited nodes F1 score
+
+The script uses the HuggingFace transformers library and supports all compatible models:
+
+Ensure the model supports apply_chat_template.
+
+If model output cannot be parsed as JSON, it is recorded as parse_error. The script tries multiple extraction methods:
+
+For large models, consider using quantized variants:
+
+If model output is truncated, increase --max-new-tokens:
+
+Same license as the main AQA-Bench project.

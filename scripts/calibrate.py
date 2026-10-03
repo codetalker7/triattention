@@ -311,5 +311,148 @@ def main() -> None:
     )
 
 
+def _head_statistics(
+    q: torch.Tensor, layer_idx: int, rope_style: str,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Summarize queries across tokens separately for each attention head.
+
+    Input q has shape [batch, heads, tokens, head_dim], with batch size one.
+    Pair dimensions into complex numbers according to rope_style: "half"
+    uses the first half as real components and the second half as imaginary
+    components; "interleaved" pairs adjacent dimensions.
+
+    For each pair, save the mean real component (q_mean_real), mean imaginary
+    component (q_mean_imag), and mean magnitude (q_abs_mean) across tokens.
+    Move these tensors to the CPU and key them by layer and head, for example
+    layer00_head03. Each tensor has head_dim / 2 entries because every complex
+    pair combines two query dimensions into one entry. The function does not
+    apply query normalization, RoPE, or RoPE inversion.
+    """
+    if q.shape[0] != 1:
+        raise ValueError("Calibration expects a single input sequence.")
+    stats = {}
+    for head_idx in range(q.shape[1]):
+        pairs = _to_complex_pairs(q[0, head_idx], style=rope_style)
+        mean = pairs.mean(dim=0)
+        stats[f"layer{layer_idx:02d}_head{head_idx:02d}"] = {
+            "q_mean_real": mean.real.cpu(),
+            "q_mean_imag": mean.imag.cpu(),
+            "q_abs_mean": pairs.abs().mean(dim=0).cpu(),
+        }
+    return stats
+
+
+def compare_statistics(reference_path: str, direct_path: str) -> dict:
+    """Compare the saved round-trip and direct statistics across every head."""
+    reference = torch.load(reference_path, map_location="cpu", weights_only=True)["stats"]
+    direct = torch.load(direct_path, map_location="cpu", weights_only=True)["stats"]
+    report = {}
+    for field in ("q_mean_real", "q_mean_imag", "q_abs_mean"):
+        ref = torch.cat([reference[head][field] for head in sorted(reference)]).double()
+        value = torch.cat([direct[head][field] for head in sorted(reference)]).double()
+        diff = value - ref
+        report[field] = {
+            "allclose": torch.allclose(value, ref, rtol=1e-2, atol=1e-4),
+            "max_abs_error": diff.abs().max().item(),
+            "relative_l2_error": (diff.norm() / ref.norm().clamp_min(1e-12)).item(),
+        }
+    return report
+
+
+def calibrate_direct(
+    model_name_or_path: str,
+    input_path: str,
+    output_path: str,
+    max_length: int = 32768,
+    device: str = "cuda",
+    attn_implementation: str = "flash_attention_2",
+) -> Path:
+    """Save raw q_proj statistics beside the original calibration output."""
+    out = Path(output_path)
+    metadata = torch.load(out, map_location="cpu", weights_only=True)["metadata"]
+    print(f"Loading model for direct calibration: {model_name_or_path}", file=sys.stderr)
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+        attn_implementation=attn_implementation,
+        trust_remote_code=True,
+    )
+    model.eval()
+    num_heads = config.num_attention_heads
+    head_dim = getattr(config, "head_dim", config.hidden_size // num_heads)
+    rope_style = _determine_rope_style(config)
+    text = Path(input_path).read_text(encoding="utf-8")
+    input_ids = tokenizer.encode(text, return_tensors="pt", truncation=True, max_length=max_length)
+    input_ids = input_ids.to(torch.device(device))
+    stats: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    def _make_projection_hook(layer_idx):
+        def hook_fn(module, args, output):
+            bsz, q_len, _ = output.shape
+            q = output.detach().view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+            stats.update(_head_statistics(q, layer_idx, rope_style))
+        return hook_fn
+
+    handles = []
+    try:
+        for layer_idx, attn in enumerate(_find_attention_layers(model)):
+            handles.append(attn.q_proj.register_forward_hook(_make_projection_hook(layer_idx)))
+        print("Running direct calibration forward pass...", file=sys.stderr)
+        with torch.no_grad():
+            model(input_ids)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    if len(stats) != config.num_hidden_layers * num_heads:
+        raise RuntimeError("Did not capture queries for every attention head.")
+    direct_out = out.with_name(f"{out.stem}.direct{out.suffix}")
+    torch.save({
+        "metadata": {**metadata, "query_capture": "pre_q_norm_pre_rope"},
+        "stats": stats,
+    }, direct_out)
+    print(f"Saved direct stats to {direct_out}", file=sys.stderr)
+    return direct_out
+
+
+def main2() -> None:
+    """Run direct calibration after main(), then compare both saved files."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--max-length", type=int, default=32768)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--attn-implementation", default="flash_attention_2")
+    args = parser.parse_args()
+    direct_out = calibrate_direct(
+        model_name_or_path=args.model,
+        input_path=args.input,
+        output_path=args.output,
+        max_length=args.max_length,
+        device=args.device,
+        attn_implementation=args.attn_implementation,
+    )
+    print("Comparing saved statistics (rtol=0.01, atol=0.0001):", file=sys.stderr)
+    for field, metrics in compare_statistics(args.output, str(direct_out)).items():
+        print(
+            f"  {field}: allclose={metrics['allclose']}, "
+            f"max_abs={metrics['max_abs_error']:.6g}, "
+            f"relative_L2={metrics['relative_l2_error']:.6g}",
+            file=sys.stderr,
+        )
+
+
 if __name__ == "__main__":
     main()
+    main2()
+
+"""
+python scripts/calibrate.py --model Qwen/Qwen3-0.6B --input calibration_text.txt --output triattention/calibration/custom/qwen3-0.6b.pt
+
+# inside ipython
+%run -d scripts/calibrate.py --model Qwen/Qwen3-0.6B --input calibration_text.txt --output triattention/calibration/custom/qwen3-0.6b.pt
+"""

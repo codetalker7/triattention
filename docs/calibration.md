@@ -24,6 +24,14 @@ A Wikipedia article, a book chapter, or a source code file are all good choices.
 
 The calibration script runs a forward pass on plain text input, captures query states from every attention layer, inverts RoPE, and computes per-head frequency statistics. The resulting `.pt` file is loaded at inference time to score keys via the trigonometric series.
 
+The script also runs a separate direct calibration pass via `main2()`,
+which captures raw `q_proj` outputs before Q normalization and RoPE. For
+`--output stats.pt`, the original method saves `stats.pt` and the direct method
+saves `stats.direct.pt`. Afterward, it compares all heads and prints maximum
+absolute error, relative L2 error, and `allclose` for each statistic
+(rtol=0.01, atol=0.0001). The original calibration code is unchanged.
+For CPU runs, add `--device cpu --attn-implementation eager`.
+
 ## Pre-computed Stats
 
 Stats are organised by experiment target. Each sub-directory contains per-model `.pt` files:
